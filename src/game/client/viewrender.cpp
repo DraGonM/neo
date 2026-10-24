@@ -39,6 +39,9 @@
 #include "c_rope.h"
 #include "c_effects.h"
 #include "smoke_fog_overlay.h"
+#ifdef NEO
+#include "neo_smoke_depth_proxy.h"
+#endif
 #include "materialsystem/imaterialsystemhardwareconfig.h"
 #include "VGuiMatSurface/IMatSystemSurface.h"
 #include "vgui_int.h"
@@ -4660,6 +4663,17 @@ void CRendering3dView::DrawNoZBufferTranslucentRenderables( void )
 		return;
 
 	bool bShadowDepth = (m_DrawFlags & ( DF_SHADOW_DEPTH_MAP | DF_SSAO_DEPTH_PASS ) ) != 0;
+
+#ifdef NEO
+	// Smoke writes no depth. All of it has been blended by now, so lay down
+	// invisible depth-only proxies for it right before the no-Z renderables
+	// (e.g. the cap zone ring), which then depth-test against them. The 3D sky
+	// camera is in sky-scaled space, where world-space proxies would be misplaced.
+	if ( !bShadowDepth && CurrentViewID() != VIEW_3DSKY )
+	{
+		NeoDrawSmokeDepthProxies();
+	}
+#endif
 
 	CClientRenderablesList::CEntry *pEntities = m_pRenderablesList->m_RenderGroups[RENDER_GROUP_TRANSLUCENT_ENTITY];
 	int iCurTranslucentEntity = m_pRenderablesList->m_RenderGroupCounts[RENDER_GROUP_TRANSLUCENT_ENTITY] - 1;

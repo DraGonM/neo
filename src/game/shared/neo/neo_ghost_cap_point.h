@@ -108,8 +108,9 @@ public:
 	// among them: the engine sorts translucents by one key per renderable, which
 	// can't order a thin ring against a huge smoke cloud. This does NOT disable
 	// depth testing -- the ring materials keep it -- so the ring is still hidden
-	// by whatever has written depth in front of it (the world, and smoke via
-	// Neo_UnlitGenericZ on its particle material).
+	// by whatever has written depth in front of it: the world, and smoke via
+	// the invisible depth-only proxies NeoDrawSmokeDepthProxies() lays down for
+	// every smoke right before the no-Z renderables are drawn.
 	virtual bool IgnoresZBuffer(void) const override { return true; }
 	virtual void GetRenderBoundsWorldspace(Vector& mins, Vector& maxs) override;
 	virtual int DrawModel(int flags) override;

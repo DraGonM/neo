@@ -22,7 +22,7 @@
 
 #ifdef NEO
 #include "c_neo_player.h"
-#include "neo_smoke_visual_state.h"
+#include "neo_smoke_depth_proxy.h"
 #endif
 
 // memdbgon must be the last include file in a .cpp file!!!
@@ -171,9 +171,9 @@ private:
 // State variables from server.
 public:
 #ifdef NEO
-	// See NeoGetSmokeGrenadeVisualState().
-	float						GetExpandRadius() const { return m_ExpandRadius; }
-	float						GetMaxExpandRadius() const { return m_SpacingRadius * 2; }
+	// Radius of the invisible depth-only sphere standing in for this smoke's
+	// volume (see NeoDrawSmokeDepthProxies()). 0 until the volume has formed.
+	float						GetDepthProxyRadius() const;
 #endif
 
 	
@@ -222,29 +222,205 @@ private:
 
 
 #ifdef NEO
-bool NeoGetSmokeGrenadeVisualState(C_BaseEntity *pEnt, NeoSmokeGrenadeVisualState_t &outState)
+// ------------------------------------------------------------------------- //
+// Depth proxies
+//
+// Smoke writes no depth, so translucents drawn after it (the cap zone ring)
+// can't be depth-tested against it. NeoDrawSmokeDepthProxies() draws an
+// invisible depth-only sphere per live smoke instead.
+// ------------------------------------------------------------------------- //
+
+// The proxy follows the smoke's real expanding sphere (radius 0 -> ~330 over
+// SMOKESPHERE_EXPAND_TIME). The visibly opaque core is smaller than that radius
+// (density falls off towards the edge), so this scales it down.
+static constexpr float SMOKE_DEPTH_PROXY_SCALE = 0.575f;
+// While the smoke dissipates its alpha fades 1 -> 0; the proxy radius is
+// multiplied by fade^power so it shrinks (and whatever it hides reappears)
+// sooner than the smoke visually thins out. 1 = shrinks in step with the fade.
+static constexpr float SMOKE_DEPTH_PROXY_FADE_POWER = 1.0f;
+static constexpr float SMOKE_DEPTH_PROXY_MIN_RADIUS = 8.0f;
+// Proxies farther than this (plus their radius) from the view are skipped.
+static constexpr float SMOKE_DEPTH_PROXY_MAX_DISTANCE = 2048.0f;
+static constexpr int SMOKE_DEPTH_PROXY_MAX_COUNT = 32;
+
+ConVar cl_neo_smoke_depth_proxy_debug("cl_neo_smoke_depth_proxy_debug", "0", FCVAR_CHEAT,
+	"Draw the smoke depth proxy spheres as opaque magenta (instead of depth-only) for tuning.");
+
+// Every live client smoke instance. Added in the constructor and removed in
+// the destructor, so it is exactly the set of existing entities regardless of
+// whether Start() succeeded.
+static CUtlVector<C_ParticleSmokeGrenade*> s_NeoSmokes;
+
+float C_ParticleSmokeGrenade::GetDepthProxyRadius() const
 {
-	C_ParticleSmokeGrenade *pSmoke = dynamic_cast<C_ParticleSmokeGrenade*>(pEnt);
-	if (!pSmoke || pSmoke->m_CurrentStage != 1)
+	// m_SpacingRadius and m_SmokeBasePos are only valid once FillVolume() ran.
+	if (m_CurrentStage != 1)
 	{
-		return false;
+		return 0.0f;
 	}
 
-	const float maxRadius = pSmoke->GetMaxExpandRadius();
-	if (maxRadius <= 0.0f)
+	const float maxExpandRadius = m_SpacingRadius * 2;
+	if (maxExpandRadius <= 0.0f)
 	{
-		return false;
+		return 0.0f;
 	}
 
-	const float expandRadius = pSmoke->GetExpandRadius();
-	const float expandFraction = expandRadius / maxRadius;
+	const float expandFraction = m_ExpandRadius / maxExpandRadius;
+	// m_FadeAlpha is the time fade already multiplied by expandFraction (see
+	// Update()); undo that to get the pure fade.
+	const float fade = (expandFraction > 0.01f) ? clamp(m_FadeAlpha / expandFraction, 0.0f, 1.0f) : 1.0f;
 
-	outState.center = pSmoke->m_SmokeBasePos;
-	outState.expandRadius = expandRadius;
-	// m_FadeAlpha is the time fade already multiplied by expandFraction
-	// (see Update()); undo that to get the pure fade.
-	outState.fade = (expandFraction > 0.01f) ? clamp(pSmoke->m_FadeAlpha / expandFraction, 0.0f, 1.0f) : 1.0f;
-	return true;
+	return m_ExpandRadius * SMOKE_DEPTH_PROXY_SCALE * powf(fade, SMOKE_DEPTH_PROXY_FADE_POWER);
+}
+
+struct NeoSmokeDepthProxy_t
+{
+	Vector center;
+	float radius;
+};
+
+// Draws one UV sphere per proxy. Each quad is emitted with both windings so
+// the result doesn't depend on the bound material's cull mode (otherwise only
+// the far hemisphere might write depth and things behind the cloud would show
+// through).
+void NeoDrawSmokeDepthProxies()
+{
+	if (s_NeoSmokes.IsEmpty())
+	{
+		return;
+	}
+
+	// Collect the proxies that can actually be seen first, so the render
+	// state below is only touched when something is drawn.
+	NeoSmokeDepthProxy_t proxies[SMOKE_DEPTH_PROXY_MAX_COUNT];
+	int proxyCount = 0;
+
+	const Vector& viewOrigin = CurrentViewOrigin();
+	const VPlane *pFrustum = view->GetFrustum();
+
+	FOR_EACH_VEC(s_NeoSmokes, smokeIndex)
+	{
+		if (proxyCount >= SMOKE_DEPTH_PROXY_MAX_COUNT)
+		{
+			break;
+		}
+
+		const C_ParticleSmokeGrenade *pSmoke = s_NeoSmokes[smokeIndex];
+		const float radius = pSmoke->GetDepthProxyRadius();
+		if (radius < SMOKE_DEPTH_PROXY_MIN_RADIUS)
+		{
+			continue;
+		}
+
+		const Vector& center = pSmoke->m_SmokeBasePos;
+		const float maxDistance = SMOKE_DEPTH_PROXY_MAX_DISTANCE + radius;
+		if (viewOrigin.DistToSqr(center) > maxDistance * maxDistance)
+		{
+			continue;
+		}
+
+		if (R_CullSphere(pFrustum, 5, &center, radius))
+		{
+			continue;
+		}
+
+		proxies[proxyCount].center = center;
+		proxies[proxyCount].radius = radius;
+		proxyCount++;
+	}
+
+	if (proxyCount == 0)
+	{
+		return;
+	}
+
+	// The sphere is split into LATITUDE_BANDS rings from pole to pole, each ring
+	// into LONGITUDE_SEGMENTS quads around the vertical axis.
+	constexpr int LATITUDE_BANDS = 8;
+	constexpr int LONGITUDE_SEGMENTS = 12;
+	// Both windings of every quad.
+	constexpr int QUADS_PER_SPHERE = LATITUDE_BANDS * LONGITUDE_SEGMENTS * 2;
+
+	const bool debug = cl_neo_smoke_depth_proxy_debug.GetBool();
+
+	IMaterial *pMaterial = materials->FindMaterial("debug/debugvertexcolor", TEXTURE_GROUP_OTHER);
+	if (!pMaterial || pMaterial->IsErrorMaterial())
+	{
+		return;
+	}
+
+	CMatRenderContextPtr pRenderContext(materials);
+	if (!debug)
+	{
+		// Depth only: the proxies must stay invisible.
+		pRenderContext->OverrideColorWriteEnable(true, false);
+		pRenderContext->OverrideAlphaWriteEnable(true, false);
+	}
+
+	pRenderContext->Bind(pMaterial);
+
+	CMeshBuilder meshBuilder;
+
+	// Appends one vertex on the sphere's surface. latitudeLine runs
+	// 0..LATITUDE_BANDS (north pole to south pole), longitudeLine
+	// 0..LONGITUDE_SEGMENTS (once around).
+	auto emitSphereVertex = [&](const Vector& sphereCenter, float sphereRadius, int latitudeLine, int longitudeLine)
+	{
+		const float polarAngle = M_PI_F * ((float)latitudeLine / LATITUDE_BANDS);
+		const float azimuthAngle = 2.0f * M_PI_F * ((float)longitudeLine / LONGITUDE_SEGMENTS);
+
+		const Vector surfaceNormal(
+			sinf(polarAngle) * cosf(azimuthAngle),
+			sinf(polarAngle) * sinf(azimuthAngle),
+			cosf(polarAngle));
+		const Vector surfacePosition = sphereCenter + surfaceNormal * sphereRadius;
+
+		meshBuilder.Position3f(surfacePosition.x, surfacePosition.y, surfacePosition.z);
+		meshBuilder.Normal3f(surfaceNormal.x, surfaceNormal.y, surfaceNormal.z);
+		meshBuilder.Color4ub(255, 0, 255, 255);
+		meshBuilder.TexCoord2f(0, 0.0f, 0.0f);
+		meshBuilder.AdvanceVertex();
+	};
+
+	for (int proxyIndex = 0; proxyIndex < proxyCount; proxyIndex++)
+	{
+		const Vector& sphereCenter = proxies[proxyIndex].center;
+		const float sphereRadius = proxies[proxyIndex].radius;
+
+		// One mesh per sphere keeps every mesh far below the dynamic mesh
+		// vertex limit however many smokes are out.
+		IMesh *pMesh = pRenderContext->GetDynamicMesh(true);
+		meshBuilder.Begin(pMesh, MATERIAL_QUADS, QUADS_PER_SPHERE);
+
+		for (int band = 0; band < LATITUDE_BANDS; band++)
+		{
+			for (int segment = 0; segment < LONGITUDE_SEGMENTS; segment++)
+			{
+				const int northLine = band;
+				const int southLine = band + 1;
+				const int westLine = segment;
+				const int eastLine = segment + 1;
+
+				emitSphereVertex(sphereCenter, sphereRadius, northLine, westLine);
+				emitSphereVertex(sphereCenter, sphereRadius, northLine, eastLine);
+				emitSphereVertex(sphereCenter, sphereRadius, southLine, eastLine);
+				emitSphereVertex(sphereCenter, sphereRadius, southLine, westLine);
+
+				emitSphereVertex(sphereCenter, sphereRadius, southLine, westLine);
+				emitSphereVertex(sphereCenter, sphereRadius, southLine, eastLine);
+				emitSphereVertex(sphereCenter, sphereRadius, northLine, eastLine);
+				emitSphereVertex(sphereCenter, sphereRadius, northLine, westLine);
+			}
+		}
+
+		meshBuilder.End(false, true);
+	}
+
+	if (!debug)
+	{
+		pRenderContext->OverrideAlphaWriteEnable(false, true);
+		pRenderContext->OverrideColorWriteEnable(false, true);
+	}
 }
 #endif
 
@@ -357,11 +533,18 @@ C_ParticleSmokeGrenade::C_ParticleSmokeGrenade()
 	m_CurrentStage = 0;
 
 	m_bStarted = false;
+
+#ifdef NEO
+	s_NeoSmokes.AddToTail(this);
+#endif
 }
 
 
 C_ParticleSmokeGrenade::~C_ParticleSmokeGrenade()
 {
+#ifdef NEO
+	s_NeoSmokes.FindAndRemove(this);
+#endif
 	ParticleMgr()->RemoveEffect( &m_ParticleEffect );
 }
 
